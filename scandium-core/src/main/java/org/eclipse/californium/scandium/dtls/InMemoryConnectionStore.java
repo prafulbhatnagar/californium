@@ -21,17 +21,20 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.eclipse.californium.scandium.util.LeastRecentlyUsedCache;
+import org.eclipse.californium.scandium.util.LeastRecentlyUsedCache.Predicate;
 
 /**
  * An in-memory <code>ConnectionStore</code> with a configurable maximum capacity
  * and support for evicting stale connections based on a <em>least recently used</em> policy.
- * 
+ * <p>
  * The store keeps track of the connections' last-access time automatically.
  * Every time a connection is read from or put to the store the access-time
  * is updated.
- * 
+ * </p>
+ * <p>
  * A connection can be successfully added to the store if any of the
  * following conditions is met:
+ * </p>
  * <ul>
  * <li>The store's remaining capacity is greater than zero.</li>
  * <li>The store contains at least one <em>stale</em> connection, i.e. a
@@ -40,29 +43,47 @@ import org.eclipse.californium.scandium.util.LeastRecentlyUsedCache;
  * recently accessed stale connection gets evicted from the store to make
  * place for the new connection to be added.</li>
  * </ul>
- * 
+ * <p>
  * This implementation uses a <code>java.util.HashMap</code> with
  * a connection's peer address as key as its backing store.
  * In addition to that the store keeps a doubly-linked list of the
  * connections in access-time order.
- * 
+ * </p>
+ * <p>
  * Insertion, lookup and removal of connections is done in
  * <em>O(log n)</em>.
- * 
+ * </p>
+ * <p>
  * Storing and reading to/from the store is thread safe.
+ * </p>
  */
-public class InMemoryConnectionStore extends LeastRecentlyUsedCache<InetSocketAddress, Connection> implements ResumptionSupportingConnectionStore {
+public class InMemoryConnectionStore implements ResumptionSupportingConnectionStore, SessionListener {
 
 	private static final Logger LOG = Logger.getLogger(InMemoryConnectionStore.class.getName());
-	
+	private static final int DEFAULT_CACHE_SIZE = 500000;
+	private static final long DEFAULT_EXPIRATION_THRESHOLD = 36 * 60 * 60; // 36h
+	private LeastRecentlyUsedCache<InetSocketAddress, Connection> connections;
+	private SessionCache establishedSessionStateCache;
+
 	/**
-	 * Creates a store with a capacity of 500000 sessions and
+	 * Creates a store with a capacity of 500000 connections and
 	 * a connection expiration threshold of 36 hours.
 	 */
 	public InMemoryConnectionStore() {
-		super();
+		this(DEFAULT_CACHE_SIZE, DEFAULT_EXPIRATION_THRESHOLD);
 	}
-	
+
+	/**
+	 * Creates a store with a capacity of 500000 connections and a connection
+	 * expiration threshold of 36 hours.
+	 * 
+	 * @param connectionStateCache a second level cache to use for <em>current</em>
+	 *                             connection state of established DTLS sessions.
+	 */
+	public InMemoryConnectionStore(SessionCache connectionStateCache) {
+		this(DEFAULT_CACHE_SIZE, DEFAULT_EXPIRATION_THRESHOLD, connectionStateCache);
+	}
+
 	/**
 	 * Creates a store based on given configuration parameters.
 	 * 
@@ -71,8 +92,23 @@ public class InMemoryConnectionStore extends LeastRecentlyUsedCache<InetSocketAd
 	 *            connection is considered stale and can be evicted from the store if
 	 *            a new connection is to be added to the store
 	 */
-	public InMemoryConnectionStore(int capacity, final long threshold) {
-		super(capacity, threshold);
+	public InMemoryConnectionStore(final int capacity, final long threshold) {
+		this(capacity, threshold, null);
+	}
+
+	/**
+	 * Creates a store based on given configuration parameters.
+	 * 
+	 * @param capacity the maximum number of connections the store can manage
+	 * @param threshold the period of time of inactivity (in seconds) after which a
+	 *            connection is considered stale and can be evicted from the store if
+	 *            a new connection is to be added to the store
+	 * @param establishedSessionStateCache a second level cache to use for <em>current</em>
+	 *                             connection state of established DTLS sessions.
+	 */
+	public InMemoryConnectionStore(final int capacity, final long threshold, final SessionCache establishedSessionStateCache) {
+		connections = new LeastRecentlyUsedCache<>(capacity, threshold);
+		this.establishedSessionStateCache = establishedSessionStateCache;
 		LOG.log(Level.CONFIG, "Created new InMemoryConnectionStore [capacity: {0}, connection expiration threshold: {1}s]",
 				new Object[]{capacity, threshold});
 	}
@@ -101,38 +137,82 @@ public class InMemoryConnectionStore extends LeastRecentlyUsedCache<InetSocketAd
 	public final synchronized boolean put(Connection connection) {
 		
 		if (connection != null) {
-			return put(connection.getPeerAddress(), connection);
+			return connections.put(connection.getPeerAddress(), connection);
 		} else {
 			return false;
 		}
 	}
-	
+
 	@Override
 	public final synchronized Connection find(final SessionId id) {
 		if (id == null) {
 			return null;
 		} else {
-			return find(new Predicate<Connection>() {
+			Connection result = connections.find(new Predicate<Connection>() {
 				@Override
 				public boolean accept(Connection connection) {
 					DTLSSession session = connection.getEstablishedSession();
-					if (session != null) {
-						return id.equals(session.getSessionIdentifier());
-					} else {
-						return false;
-					}
+					return session != null && id.equals(session.getSessionIdentifier());
 				}
 			});
+			if (result == null && establishedSessionStateCache != null) {
+				// not found in local cache, try second level cache
+				DTLSSession establishedSession = establishedSessionStateCache.get(id);
+				if (establishedSession != null) {
+					// this probably means that we are taking over the session
+					// from a failed node
+					result = new Connection(establishedSession);
+				}
+			}
+			return result;
 		}
 	}
-	
+
 	@Override
 	public synchronized void markAllAsResumptionRequired() {
-		for (Iterator<Connection> iterator = values(); iterator.hasNext();) {
+		for (Iterator<Connection> iterator = connections.values(); iterator.hasNext(); ) {
 			Connection c = iterator.next();
 			if (c != null){
-				c.setResumptionRequired(true);;
+				c.setResumptionRequired(true);
 			}
 		}
+	}
+
+	@Override
+	public final synchronized int remainingCapacity() {
+		return connections.remainingCapacity();
+	}
+
+	@Override
+	public final synchronized Connection get(InetSocketAddress peerAddress) {
+		return connections.get(peerAddress);
+	}
+
+	@Override
+	public final synchronized Connection remove(InetSocketAddress peerAddress) {
+		return connections.remove(peerAddress);
+	}
+
+	@Override
+	public final synchronized void clear() {
+		connections.clear();
+	}
+
+	@Override
+	public void handshakeStarted(Handshaker handshaker) throws HandshakeException {
+		// nothing to do
+	}
+
+	@Override
+	public void sessionEstablished(Handshaker handshaker, DTLSSession establishedSession) throws HandshakeException {
+		if (establishedSessionStateCache != null) {
+			// put current connection state to second level cache
+			establishedSessionStateCache.put(establishedSession);
+		}
+	}
+
+	@Override
+	public void handshakeCompleted(InetSocketAddress peer) {
+		// nothing to do
 	}
 }
